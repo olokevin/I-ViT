@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=1 python quant_train.py --model deit_tiny --data /home/zyq123/dataset/ImageNet2012 --epochs 30 --lr 5e-7 

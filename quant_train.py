@@ -165,7 +165,7 @@ def main():
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
     logging.basicConfig(format='%(asctime)s - %(message)s',
-                        datefmt='%d-%b-%y %H:%M:%S', filename=args.output_dir + 'log.log')
+                        datefmt='%d-%b-%y %H:%M:%S', filename=args.output_dir + f'{args.model}.log')
     logging.getLogger().setLevel(logging.INFO)
     logging.getLogger().addHandler(logging.StreamHandler())
     logging.info(args)
