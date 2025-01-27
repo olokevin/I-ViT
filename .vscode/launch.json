@@ -1,0 +1,26 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug quant_train.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "quant_train.py",
+      "console": "integratedTerminal",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "--model", "deit_tiny",
+        "--data", "/home/yequan_zhao/dataset/ImageNet2012",
+        "--epochs", "30",
+        "--lr", "1e-6",
+        "--batch-size", "64",
+        "--no-train"
+      ]
+    }
+  ]
+}

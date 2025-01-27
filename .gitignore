@@ -12,6 +12,7 @@ quantize/
 
 assets/
 temp/
+results/
 
 # C extensions
 *.so

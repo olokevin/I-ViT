@@ -24,7 +24,8 @@ parser = argparse.ArgumentParser(description="I-ViT")
 
 parser.add_argument("--model", default='deit_tiny',
                     choices=['deit_tiny', 'deit_small', 'deit_base', 
-                             'swin_tiny', 'swin_small', 'swin_base'],
+                             'swin_tiny', 'swin_small', 'swin_base',
+                             'vit_base', 'vit_large'],
                     help="model")
 parser.add_argument('--data', metavar='DIR', default='/dataset/imagenet/',
                     help='path to dataset')
@@ -137,6 +138,8 @@ parser.add_argument('--mixup-mode', type=str, default='batch',
 
 parser.add_argument('--best-acc1', type=float, default=0, help='best_acc1')
 
+parser.add_argument('--no-train', action='store_true')
+
 
 def str2model(name):
     d = {'deit_tiny': deit_tiny_patch16_224,
@@ -145,6 +148,8 @@ def str2model(name):
          'swin_tiny': swin_tiny_patch4_window7_224,
          'swin_small': swin_small_patch4_window7_224,
          'swin_base': swin_base_patch4_window7_224,
+         'vit_base': vit_base_patch16_224,
+         'vit_large': vit_large_patch16_224,
          }
     print('Model: %s' % d[name].__name__)
     return d[name]
@@ -161,11 +166,13 @@ def main():
 
     import warnings
     warnings.filterwarnings('ignore')
+    
+    args.output_dir = os.path.join(args.output_dir, args.model, str(os.getpid()))
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
     logging.basicConfig(format='%(asctime)s - %(message)s',
-                        datefmt='%d-%b-%y %H:%M:%S', filename=args.output_dir + f'{args.model}.log')
+                        datefmt='%d-%b-%y %H:%M:%S', filename=os.path.join(args.output_dir + '/log.log'))
     logging.getLogger().setLevel(logging.INFO)
     logging.getLogger().addHandler(logging.StreamHandler())
     logging.info(args)
@@ -188,7 +195,7 @@ def main():
                                   num_classes=args.nb_classes,
                                   drop_rate=args.drop,
                                   drop_path_rate=args.drop_path)
-    model.to(device)
+    model = model.to(device)
 
     model_ema = None
     if args.model_ema:
@@ -213,30 +220,50 @@ def main():
         criterion = nn.CrossEntropyLoss()
     criterion_v = nn.CrossEntropyLoss()
 
+    # if args.resume:
+    #     if args.resume.startswith('https'):
+    #         checkpoint = torch.hub.load_state_dict_from_url(
+    #             args.resume, map_location='cpu', check_hash=True)
+    #     else:
+    #         checkpoint = torch.load(args.resume, map_location='cpu')
+    #     model.load_state_dict(checkpoint['model'])
+    #     if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+    #         optimizer.load_state_dict(checkpoint['optimizer'])
+    #         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+    #         args.start_epoch = checkpoint['epoch'] + 1
+    #         if args.model_ema:
+    #             load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
+    #         if 'scaler' in checkpoint:
+    #             loss_scaler.load_state_dict(checkpoint['scaler'])
+    #     lr_scheduler.step(args.start_epoch)
+    
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
-        model.load_state_dict(checkpoint['model'])
-        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            args.start_epoch = checkpoint['epoch'] + 1
-            if args.model_ema:
-                load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
-            if 'scaler' in checkpoint:
-                loss_scaler.load_state_dict(checkpoint['scaler'])
-        lr_scheduler.step(args.start_epoch)
+            checkpoint = torch.load(args.resume, map_location=device)
+        
+        for key in checkpoint.keys():
+            if 'act_scaling_factor' in key:
+                checkpoint[key] = torch.tensor([checkpoint[key]], device=device)
+        model.load_state_dict(checkpoint, strict=False, assign=True)
+    
+    from ZO.real_quant import replace_Quant_with_RealQuant
+    replace_Quant_with_RealQuant(model)
+
+    model = model.to(device)
 
     print(f"Start training for {args.epochs} epochs")
     best_epoch = 0
     for epoch in range(args.start_epoch, args.epochs):
         # train for one epoch
-        train(args, train_loader, model, criterion, optimizer, epoch,
-              loss_scaler, args.clip_grad, model_ema, mixup_fn, device)
-        lr_scheduler.step(epoch)
+        if args.no_train:
+            pass
+        else:
+            train(args, train_loader, model, criterion, optimizer, epoch,
+                  loss_scaler, args.clip_grad, model_ema, mixup_fn, device)
+            lr_scheduler.step(epoch)
 
         # if args.output_dir:  # this is for resume training
         #     checkpoint_path = os.path.join(args.output_dir, 'checkpoint.pth.tar')
@@ -258,7 +285,7 @@ def main():
         if is_best:
             # record the best epoch
             best_epoch = epoch
-            torch.save(model.state_dict(), os.path.join(args.output_dir, 'checkpoint.pth.tar'))
+            torch.save(model.state_dict(), os.path.join(args.output_dir, f'{args.model}_checkpoint.pth.tar'))
         logging.info(f'Acc at epoch {epoch}: {acc1}')
         logging.info(f'Best acc at epoch {best_epoch}: {args.best_acc1}')
 
@@ -309,6 +336,8 @@ def train(args, train_loader, model, criterion, optimizer, epoch, loss_scaler, m
 
         if i % args.print_freq == 0:
             progress.display(i)
+        
+        # torch.save(model.state_dict(), os.path.join(args.output_dir, f'{args.model}_checkpoint.pth.tar'))
 
 
 def validate(args, val_loader, model, criterion, device):

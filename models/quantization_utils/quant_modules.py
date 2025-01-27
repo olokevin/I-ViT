@@ -188,8 +188,8 @@ class QuantAct(nn.Module):
                 self.max_val = self.max_val.max()
                 self.min_val = self.min_val.min()
 
-            self.act_scaling_factor = symmetric_linear_quantization_params(
-                self.activation_bit, self.min_val, self.max_val)
+                self.act_scaling_factor = symmetric_linear_quantization_params(
+                    self.activation_bit, self.min_val, self.max_val)
 
         if pre_act_scaling_factor is None:
             # this is for the input quantization
@@ -341,7 +341,8 @@ class IntLayerNorm(nn.LayerNorm):
                 elementwise_affine=True):
         super(IntLayerNorm, self).__init__(normalized_shape, eps, elementwise_affine)
         self.dim_sqrt = None
-        self.register_buffer('norm_scaling_factor', torch.zeros(1))
+        # self.register_buffer('norm_scaling_factor', torch.zeros(1))
+        self.register_buffer('norm_scaling_factor', torch.zeros(normalized_shape))
         self.register_buffer('bias_integer', torch.zeros_like(self.bias))
 
     def fix(self):
