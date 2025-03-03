@@ -5,7 +5,7 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Debug quant_train.py",
+      "name": "QAT",
       "type": "debugpy",
       "request": "launch",
       "program": "quant_train.py",
@@ -20,6 +20,30 @@
         "--lr", "1e-6",
         "--batch-size", "64",
         "--no-train"
+      ]
+    },
+    {
+      "name": "imagenet-c",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "quant_train.py",
+      "console": "integratedTerminal",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "--model", "deit_tiny",
+        "--data", "/home/yequan_zhao/dataset",
+        "--data-set", "imagenet_c-3-5000-gaussian_noise",
+        "--resume", "results/deit_tiny_checkpoint.pth.tar",
+        "--epochs", "30",
+        "--batch-size", "100",
+
+        "--lr", "1e-2",
+        "--opt", "sgd",
+        "--real-quant",
+
+        "--en-ZO",
       ]
     }
   ]

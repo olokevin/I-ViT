@@ -9,27 +9,39 @@ import torch
 import torch.nn as nn
 from pathlib import Path
 
+import timm
 from timm.data import Mixup
 from timm.models import create_model
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
-from timm.utils import NativeScaler, get_state_dict, ModelEma, accuracy
+from timm.utils import get_state_dict, ModelEma, accuracy
+# from timm.utils import NativeScaler
 
 from models import *
 from utils import *
+
+import random
+import easydict
+from quant.real_quant import replace_Quant_with_RealQuant, RealQuant_Scaler, NativeScaler
+from quant.real_quant import efficient_real_quant_perturb_parameters, efficient_real_quant_gen_grad
+
+# DEBUG = False
+DEBUG = True
 
 
 parser = argparse.ArgumentParser(description="I-ViT")
 
 parser.add_argument("--model", default='deit_tiny',
-                    choices=['deit_tiny', 'deit_small', 'deit_base', 
-                             'swin_tiny', 'swin_small', 'swin_base',
-                             'vit_base', 'vit_large'],
+                    # choices=['deit_tiny', 'deit_small', 'deit_base', 
+                    #          'swin_tiny', 'swin_small', 'swin_base',
+                    #          'vit_base', 'vit_large'],
                     help="model")
 parser.add_argument('--data', metavar='DIR', default='/dataset/imagenet/',
                     help='path to dataset')
-parser.add_argument('--data-set', default='IMNET', choices=['CIFAR', 'IMNET'],
+# parser.add_argument('--data-set', default='IMNET', choices=['CIFAR', 'IMNET'],
+#                     type=str, help='Image Net dataset path')
+parser.add_argument('--data-set', default='IMNET',
                     type=str, help='Image Net dataset path')
 parser.add_argument("--nb-classes", default=1000, type=int, help="number of classes")
 parser.add_argument('--input-size', default=224, type=int, help='images input size')
@@ -54,8 +66,11 @@ parser.set_defaults(pin_mem=True)
 
 parser.add_argument('--drop', type=float, default=0.0, metavar='PCT',
                     help='Dropout rate (default: 0.)')
-parser.add_argument('--drop-path', type=float, default=0.1, metavar='PCT',
-                    help='Drop path rate (default: 0.1)')
+# parser.add_argument('--drop-path', type=float, default=0.1, metavar='PCT',
+#                     help='Drop path rate (default: 0.1)')
+parser.add_argument('--drop-path', type=float, default=0.0, metavar='PCT',
+                    help='Drop path rate (default: 0.)')
+
 
 parser.add_argument('--model-ema', action='store_true')
 parser.add_argument('--no-model-ema', action='store_false', dest='model_ema')
@@ -140,6 +155,10 @@ parser.add_argument('--best-acc1', type=float, default=0, help='best_acc1')
 
 parser.add_argument('--no-train', action='store_true')
 
+parser.add_argument('--real-quant', action='store_true')
+
+parser.add_argument('--en-ZO', action='store_true')
+
 
 def str2model(name):
     d = {'deit_tiny': deit_tiny_patch16_224,
@@ -154,6 +173,16 @@ def str2model(name):
     print('Model: %s' % d[name].__name__)
     return d[name]
 
+# def set_torch_deterministic(random_state: int = 0) -> None:
+#     random_state = int(random_state) % (2 ** 32)
+#     # random_state = int(random_state)
+#     torch.manual_seed(random_state)
+#     np.random.seed(random_state)
+#     if torch.cuda.is_available():
+#         torch.backends.cudnn.deterministic = True
+#         torch.backends.cudnn.benchmark = False
+#         torch.cuda.manual_seed_all(random_state)
+#     random.seed(random_state)
 
 def main():
     args = parser.parse_args()
@@ -176,6 +205,7 @@ def main():
     logging.getLogger().setLevel(logging.INFO)
     logging.getLogger().addHandler(logging.StreamHandler())
     logging.info(args)
+    logging.info(str(os.getpid()))
 
     device = torch.device(args.device)
 
@@ -191,12 +221,104 @@ def main():
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
     # Model
-    model = str2model(args.model)(pretrained=True,
-                                  num_classes=args.nb_classes,
-                                  drop_rate=args.drop,
-                                  drop_path_rate=args.drop_path)
+    if 'fp32' in args.model:
+        model_name = args.model.split('_', 1)[-1]
+        model = timm.create_model(model_name, pretrained=True)
+    else:
+        model = str2model(args.model)(pretrained=True,
+                                      num_classes=args.nb_classes,
+                                      drop_rate=args.drop,
+                                      drop_path_rate=args.drop_path)
+    
     model = model.to(device)
-
+    
+    if args.resume:
+        if args.resume.startswith('https'):
+            checkpoint = torch.hub.load_state_dict_from_url(
+                args.resume, map_location='cpu', check_hash=True)
+        else:
+            checkpoint = torch.load(args.resume, map_location=device)
+        
+        for key in checkpoint.keys():
+            if 'act_scaling_factor' in key:
+                checkpoint[key] = torch.tensor([checkpoint[key]], device=device)
+        model.load_state_dict(checkpoint)
+        # model.load_state_dict(checkpoint, strict=False, assign=True)
+    
+        ### RealQuant
+        if args.real_quant:
+            replace_Quant_with_RealQuant(model)
+            
+    model = model.to(device)
+    
+    
+    
+    
+    ### trainable parameters
+    param_dim = 0
+    for name, param in model.named_parameters():
+        if 'cls_token' in name:
+            # param.requires_grad = True
+            param.requires_grad = False
+        # elif 'patch_embed' in name:
+        #     param.requires_grad = True
+        
+        # elif 'blocks.0' in name:
+        #     param.requires_grad = True
+        
+        # elif 'blocks.11' in name and 'weight' in name:
+        elif 'blocks.11.attn.proj.weight' in name:
+            param.requires_grad = True
+            param_dim += int(param.numel())
+        
+        else:
+            param.requires_grad = False
+            # param.requires_grad = True
+    
+    ### ZO training
+    if args.en_ZO:
+        # ZO_config = {
+        #     'n_sample': 1000,
+        #     'sigma': 1,
+        #     'param_dim': param_dim,
+        # }
+        ZO_config = {
+          "name": "ZO_Estim_MC",
+          "sigma": 1,
+          "n_sample": 10,
+          "signsgd": False,
+          "scale": 'dim',
+          "ZO_trainable_layers_list": ["RealQuantLinear"],
+          
+          # "actv_perturb_block_idx_list": None,
+          # "param_perturb_block_idx_list": "all",
+          
+          "actv_perturb_block_idx_list": "all",
+          "param_perturb_block_idx_list": None,
+          
+          "obj_fn_type": "classifier",
+          # "estimate_method": "forward",
+          "estimate_method": "antithetic",
+          "sample_method": "bernoulli",
+          "en_layerwise_perturbation": True,
+          "en_partial_forward": False,
+          "quantized": False,
+          "normalize_perturbation": False,
+          "en_param_commit": False
+      }
+        ZO_config = easydict.EasyDict(ZO_config)
+        
+    else:
+        ZO_config = None
+    
+    # ================== ZO_Estim ======================
+    
+    if ZO_config is not None:
+        from ZO_Estim.ZO_Estim_entry import build_ZO_Estim
+        ZO_Estim = build_ZO_Estim(ZO_config, model=model, )
+    else:
+        ZO_Estim = None
+    
     model_ema = None
     if args.model_ema:
         # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
@@ -208,18 +330,28 @@ def main():
         
     args.min_lr = args.lr / 15
     optimizer = create_optimizer(args, model)
-    loss_scaler = NativeScaler()
+    if args.real_quant:
+        # loss_scaler = RealQuant_NativeScaler(model)
+        loss_scaler = RealQuant_Scaler(model)
+    else:
+        # loss_scaler = NativeScaler()
+        loss_scaler = NativeScaler(model)
     lr_scheduler, _ = create_scheduler(args, optimizer)
 
-    if mixup_active:
-        # smoothing is handled with mixup label transform
-        criterion = SoftTargetCrossEntropy()
-    elif args.smoothing:
-        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-    else:
+    if args.en_ZO:
         criterion = nn.CrossEntropyLoss()
+    else:
+        if mixup_active:
+            # smoothing is handled with mixup label transform
+            criterion = SoftTargetCrossEntropy()
+        elif args.smoothing:
+            criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+        else:
+            criterion = nn.CrossEntropyLoss()
+            
     criterion_v = nn.CrossEntropyLoss()
-
+    
+    ### old resume training
     # if args.resume:
     #     if args.resume.startswith('https'):
     #         checkpoint = torch.hub.load_state_dict_from_url(
@@ -237,22 +369,8 @@ def main():
     #             loss_scaler.load_state_dict(checkpoint['scaler'])
     #     lr_scheduler.step(args.start_epoch)
     
-    if args.resume:
-        if args.resume.startswith('https'):
-            checkpoint = torch.hub.load_state_dict_from_url(
-                args.resume, map_location='cpu', check_hash=True)
-        else:
-            checkpoint = torch.load(args.resume, map_location=device)
-        
-        for key in checkpoint.keys():
-            if 'act_scaling_factor' in key:
-                checkpoint[key] = torch.tensor([checkpoint[key]], device=device)
-        model.load_state_dict(checkpoint, strict=False, assign=True)
-    
-    from ZO.real_quant import replace_Quant_with_RealQuant
-    replace_Quant_with_RealQuant(model)
-
-    model = model.to(device)
+    # acc1 = validate(args, val_loader, model, criterion_v, device)
+    # logging.info(f'Initial Acc at epoch 0: {acc1}')
 
     print(f"Start training for {args.epochs} epochs")
     best_epoch = 0
@@ -262,7 +380,7 @@ def main():
             pass
         else:
             train(args, train_loader, model, criterion, optimizer, epoch,
-                  loss_scaler, args.clip_grad, model_ema, mixup_fn, device)
+                  loss_scaler, args.clip_grad, model_ema, mixup_fn, device, ZO_config, ZO_Estim)
             lr_scheduler.step(epoch)
 
         # if args.output_dir:  # this is for resume training
@@ -286,11 +404,11 @@ def main():
             # record the best epoch
             best_epoch = epoch
             torch.save(model.state_dict(), os.path.join(args.output_dir, f'{args.model}_checkpoint.pth.tar'))
-        logging.info(f'Acc at epoch {epoch}: {acc1}')
-        logging.info(f'Best acc at epoch {best_epoch}: {args.best_acc1}')
+        logging.info(f'Acc at epoch {epoch+1}: {acc1}')
+        logging.info(f'Best acc at epoch {best_epoch+1}: {args.best_acc1}')
 
 
-def train(args, train_loader, model, criterion, optimizer, epoch, loss_scaler, max_norm, model_ema, mixup_fn, device):
+def train(args, train_loader, model, criterion, optimizer, epoch, loss_scaler, max_norm, model_ema, mixup_fn, device, ZO_config=None, ZO_Estim=None):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -301,7 +419,15 @@ def train(args, train_loader, model, criterion, optimizer, epoch, loss_scaler, m
 
     # switch to train mode
     model.train()
-    unfreeze_model(model)
+    if 'imagenet_c' in args.data_set:
+        freeze_model(model)
+        for module in model.modules():
+            if isinstance(module, torch.nn.LayerNorm):
+                module.eval()
+                for param in module.parameters():
+                    param.requires_grad = False
+    else:
+        unfreeze_model(model)
 
     end = time.time()
     for i, (data, target) in enumerate(train_loader):
@@ -313,18 +439,141 @@ def train(args, train_loader, model, criterion, optimizer, epoch, loss_scaler, m
 
         if mixup_fn is not None:
             data, target = mixup_fn(data, target)
+            
+        if ZO_Estim is not None:
+            from ZO_Estim.ZO_Estim_entry import build_obj_fn
+            from ZO_Estim.ZO_utils import default_create_bwd_pre_hook_ZO_grad
+            obj_fn = build_obj_fn(ZO_Estim.obj_fn_type, data=data, target=target, model=model, criterion=criterion)
+            ZO_Estim.update_obj_fn(obj_fn)
+            with torch.no_grad():
+                pred, loss = obj_fn()
+                ZO_Estim.estimate_grad(old_loss=loss)
+                
+            ### pseudo NP
+            if ZO_Estim.splited_layer_list is not None:
+                # bwd_pre_hook_list = []
+                # for splited_layer in ZO_Estim.splited_layer_list:
+                #     create_bwd_pre_hook_ZO_grad = getattr(splited_layer.layer, 'create_bwd_pre_hook_ZO_grad', default_create_bwd_pre_hook_ZO_grad)
+                #     bwd_pre_hook_list.append(splited_layer.layer.register_full_backward_pre_hook(create_bwd_pre_hook_ZO_grad(splited_layer.layer.ZO_grad_output, DEBUG)))
+                # output = model(data)
+                # loss = criterion(output, target)
+                # loss.backward()
+                
+                # for bwd_pre_hook in bwd_pre_hook_list:
+                #     bwd_pre_hook.remove()
+                
+                fwd_hook_list = []
+                for splited_layer in ZO_Estim.splited_layer_list:
 
-        output = model(data)
-        loss = criterion(output, target)
+                    fwd_hook_get_param_grad = splited_layer.layer.create_fwd_hook_get_param_grad(splited_layer.layer.ZO_grad_output, DEBUG)
+                    fwd_hook_list.append(splited_layer.layer.register_forward_hook(fwd_hook_get_param_grad))
+                    
+                    with torch.no_grad():
+                        output = model(data)
+                        loss = criterion(output, target)
+                
+                for fwd_hook_handle in fwd_hook_list:
+                    fwd_hook_handle.remove()
+            
+            ### save param FO grad
+            if DEBUG:
+                for param in model.parameters():
+                    if param.requires_grad:
+                        param.ZO_grad = param.grad.clone()
+                        
+                optimizer.zero_grad()
+                
+                output = model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                
+                for param in model.parameters():
+                    if param.requires_grad:
+                        param.FO_grad = param.grad.clone()
+                
+                optimizer.zero_grad()
+            
+            ### print FO ZO grad
+                print('param cos sim')
+                for param in model.parameters():
+                    if param.requires_grad:
+                        print(f'{F.cosine_similarity(param.FO_grad.view(-1), param.ZO_grad.view(-1), dim=0)}')
+                    
+                print('param Norm ZO/FO: ')
+                for param in model.parameters():
+                    if param.requires_grad:
+                        print(f'{torch.linalg.norm(param.ZO_grad.view(-1)) / torch.linalg.norm(param.FO_grad.view(-1))}')
+                
+                optimizer.zero_grad()
+            
+        # if args.en_ZO:
+            
+            # seed_list = []
+            # loss_diff_list = []
+            # # no scale
+            # # grad_scale = 1 / ZO_config.n_sample
+            # # sqrt_fim
+            # # grad_scale = 1 / (ZO_config.n_sample + ZO_config.param_dim - 1)
+            # # dim
+            # grad_scale = 1 / math.sqrt( (ZO_config.n_sample) * (ZO_config.n_sample + ZO_config.param_dim - 1) )
+            
+            # model.eval()
+            # with torch.no_grad():
+            #     output = model(data)
+            #     loss = criterion(output, target)
+                
+            #     for _ in range(ZO_config.n_sample):
+            #         random_seed = np.random.randint(1000000000)
+            #         efficient_real_quant_perturb_parameters(model, random_seed, ZO_config.sigma)
+            #         output = model(data)
+            #         pos_loss = criterion(output, target)
+            #         efficient_real_quant_perturb_parameters(model, random_seed, -ZO_config.sigma)
+                    
+            #         # efficient_real_quant_perturb_parameters(model, random_seed, -sigma)
+            #         # output = model(data)
+            #         # neg_loss = criterion(output, target)
+            #         # efficient_real_quant_perturb_parameters(model, random_seed, sigma)
+                    
+            #         seed_list.append(random_seed)
+            #         loss_diff_list.append((pos_loss - loss) * grad_scale)
+                
+            #     efficient_real_quant_gen_grad(model, loss_diff_list, seed_list, lr=None)
+            
+            # # model.train()
+            
+            ### test
+            # ZO_grad = model.blocks[0].attn.qkv.weight.grad.clone().view(-1)
+            # optimizer.zero_grad()
+            
+            # output = model(data)
+            # loss = criterion(output, target)
 
-        # measure accuracy and record loss
-        losses.update(loss.item(), data.size(0))
+            # # compute gradient and do SGD step
+            # FO_loss_scaler = NativeScaler(model)
+            # is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
+            # FO_loss_scaler(loss, optimizer, clip_grad=max_norm,
+            #             parameters=model.parameters(), create_graph=is_second_order)
+
+            # FO_grad = model.blocks[0].attn.qkv.weight.grad.clone().view(-1)
+            
+            # print(f'ZO_norm / FO_norm: {torch.norm(ZO_grad) / torch.norm(FO_grad)}')
+            # # print cosine similarity between ZO_grad and FO_grad
+            # cosine_similarity = torch.nn.functional.cosine_similarity(ZO_grad, FO_grad, dim=0)
+            # print(f'Cosine similarity between ZO_grad and FO_grad: {cosine_similarity.item()}')
+            # print('test')
+            
+        else:
+            output = model(data)
+            loss = criterion(output, target)
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
         is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
         loss_scaler(loss, optimizer, clip_grad=max_norm,
                     parameters=model.parameters(), create_graph=is_second_order)
+
+        # measure accuracy and record loss
+        losses.update(loss.item(), data.size(0))
 
         torch.cuda.synchronize()
         if model_ema is not None:
@@ -334,8 +583,8 @@ def train(args, train_loader, model, criterion, optimizer, epoch, loss_scaler, m
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % args.print_freq == 0:
-            progress.display(i)
+        # if i % args.print_freq == 0:
+        #     progress.display(i)
         
         # torch.save(model.state_dict(), os.path.join(args.output_dir, f'{args.model}_checkpoint.pth.tar'))
 
@@ -373,10 +622,10 @@ def validate(args, val_loader, model, criterion, device):
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % args.print_freq == 0:
-            progress.display(i)
+        # if i % args.print_freq == 0:
+        #     progress.display(i)
 
-    print(" * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}".format(top1=top1, top5=top5))
+    # print(" * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}".format(top1=top1, top5=top5))
     return top1.avg
 
 

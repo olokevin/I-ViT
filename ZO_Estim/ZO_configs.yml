@@ -1,0 +1,38 @@
+ZO_Estim:
+  # en: false
+  en: true
+  name: ZO_Estim_MC
+  sigma: 0.01
+  n_sample: 10
+  signsgd: false
+
+  scale: null
+  # scale: sqrt_fim
+  # scale: dim
+
+  ZO_trainable_layers_list: ['RealQuantLinear',]
+
+  # actv_perturb_block_idx_list: null
+  # param_perturb_block_idx_list: all
+
+  actv_perturb_block_idx_list: all
+  param_perturb_block_idx_list: null
+  
+  obj_fn_type: classifier
+  # obj_fn_type: classifier_layerwise
+
+  estimate_method: forward
+  # estimate_method: antithetic
+
+  # sample_method: gaussian
+  sample_method: bernoulli
+
+  en_layerwise_perturbation: true
+  # en_layerwise_perturbation: false
+
+  # en_partial_forward: true
+  en_partial_forward: false
+
+  quantized: false
+  normalize_perturbation: false
+  en_param_commit: false
